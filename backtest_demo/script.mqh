@@ -1,12 +1,9 @@
-//+------------------------------------------------------------------+
-//|                                                         main.mq4 |
-//|                             Copyright 2023, Jay Benedict Alfaras |
-//|                                             https://www.mql5.com |
-//+------------------------------------------------------------------+
+
 #define app_copyright "Copyright 2023, Jay Alfaras"
-#define app_version "1.01"
+#define app_version "1.21"
 #define app_description "A script for implementing a daily seasonal sytem"
 #property strict
+
 
 #include <B63/Generic.mqh>
 
@@ -20,6 +17,17 @@ enum Orders{
    Short = 1,
 };
 
+enum SpreadManagement{
+   Interval = 0, 
+   Recursive = 1,
+   Ignore = 2,
+};
+
+enum TradeManagement{
+   Breakeven = 0, 
+   Trailing = 1,
+   None = 2,
+};
 
 
 /*
@@ -47,6 +55,9 @@ Order Type:
 Timeframe:
    Timeframe from Python Backtest
    
+Spread:
+   Entry Window Mean Spread from Python Backtest
+   
 // ===== ENTRY WINDOW ===== // 
 ENTRY WINDOW HOUR:
    Entry Time (Hour)
@@ -56,7 +67,7 @@ ENTRY WINDOW MINUTE:
    
 // ===== RISK MANAGEMENT ===== // 
 RISK AMOUNT:
-   Overall Aggregated Risk Amount (VAR if all trades in the basket fail.)
+   Overall Aggregated Risk Amount (Overall loss if basket fails)
    
    User Defined. 
    
@@ -73,8 +84,29 @@ ALLOCATION:
       Allocation - 0.3 (30% of total Risk Amount is allocated to this instrument)
       
       True Risk Amount - 1000 USD * 0.3 = 300 USD 
+
+TRAIL INTERVAL:
+   Minimum distance from market price to update trail stop. 
+   
+TRADE MANAGEMENT:
+   Trade Management Option
+      1. Breakeven -> Sets breakeven within trade window. Closes trade at deadline. 
+      2. Trailing -> Updates trail stop until hit by market price. Manually closes trade if in floating loss.
+      3. None -> Closes at deadline.
+      
       
 // ===== MISC ===== // 
+SPREAD MANAGEMENT:
+   Technique for handling bad spreads. 
+      1. Interval -> If bad spread, enters on next timeframe interval
+      2. Recursive -> If bad spread, executes a while loop with a delay specified by InpSpreadDelay (seconds)
+            Breaks the loop if spread improves, and price is within initial bid-ask range set with entry window
+            candle opening price. (Executing recursion causes problems)
+      3. Ignore -> Does nothing. Halts trading for the day.
+      
+SPREAD DELAY:
+   Delay in seconds to execute recursive loop. 
+
 MAGIC NUMBER:
    Magic Number
    
@@ -85,6 +117,8 @@ CSV LOGGING:
 TERMINAL LOGGING:
    Enables/Disables Terminal Logging   
 */
+
+// ========== INPUTS ========== //
 input string            InpRiskProfile    = "========== RISK PROFILE =========="; // ========== RISK PROFILE ==========
 input float             InpRPDeposit      = 100000; // RISK PROFILE: Deposit
 input float             InpRPRiskPercent  = 1; // RISK PROFILE: Risk Percent
@@ -92,6 +126,7 @@ input float             InpRPLot          = 10; // RISK PROFILE: Lot
 input int               InpRPHoldTime     = 5; // RISK PROFILE: Hold Time
 input Orders            InpRPOrderType    = Long; // RISK PROFILE: Order Type
 input ENUM_TIMEFRAMES   InpRPTimeframe    = PERIOD_M15; // RISK PROFILE: Timeframe
+input float             InpRPSpread       = 10; // RISK PROFILE: Spread
 
 input string            InpEntry          = "========== ENTRY WINDOW =========="; // ========== ENTRY WINDOW ==========
 input int               InpEntryHour      = 1; // ENTRY WINDOW HOUR 
@@ -100,18 +135,24 @@ input int               InpEntryMin       = 0; // ENTRY WINDOW MINUTE
 input string            InpRiskMgt        = "========== RISK MANAGEMENT =========="; // ========== RISK MANAGEMENT ==========
 input float             InpRiskAmount     = 1000; // RISK AMOUNT - Scales lot to match risk amount (10 lots / 1000USD)
 input float             InpAllocation     = 1; // ALLOCATION - Percentage of Total Risk
+input TradeManagement   InpTradeMgt       = None; // TRADE MANAGEMENT - BE / Trail Stop
+input float             InpTrailInterval  = 50; // TRAIL STOP INTERVAL - Trail Points Increment
+
 
 input string            InpMisc           = "========== MISC =========="; // ========== MISC ==========
+input SpreadManagement  InpSpreadMgt      = Recursive; // SPREAD MANAGEMENT
+input float             InpSpreadDelay    = 1; // SPREAD DELAY (seconds)
 input int               InpMagic          = 232323; // MAGIC NUMBER
+
 
 input string            InpLog            = "========== LOGGING =========="; // ========== LOGGING ==========
 input bool              InpLogging        = true; // CSV LOGGING - Enables/Disables Trade Logging
 input bool              InpTerminalMsg    = true; // TERMINAL LOGGING - Enables/Disables Terminal Logging
 
+// ========== INPUTS ========== //
 
 
 
-double initial_deposit = 0;
 
 struct RiskProfile{
    double RP_amount;
@@ -119,6 +160,7 @@ struct RiskProfile{
    int RP_holdtime;
    Orders RP_order_type;
    ENUM_TIMEFRAMES RP_timeframe;
+   float RP_spread;
    
    RiskProfile(){
       set_risk_profile();
@@ -130,6 +172,7 @@ struct RiskProfile{
       RP_holdtime = InpRPHoldTime; //
       RP_order_type = InpRPOrderType;
       RP_timeframe = InpRPTimeframe;
+      RP_spread = InpRPSpread;
    }
 };
 
@@ -143,6 +186,7 @@ struct TradeParameters{
    double sl_price;
    double tick_value;
    double trade_points;
+   double delayed_entry_reference;
    
    double true_risk;
    double true_lot;
@@ -153,9 +197,7 @@ struct TradeParameters{
    }
    
    double calc_lot(){
-      // calculate lot size based on drawdown or gain 
-      // size down if in drawdown
-      
+   
       double risk_amount_scale_factor = InpRiskAmount / risk_profile.RP_amount;
       true_risk = InpAllocation * InpRiskAmount;
       
@@ -171,16 +213,6 @@ struct TradeParameters{
       if (trade_type == "market") entry_price = price_ask();
       if (trade_type == "pending") entry_price = last_candle_open();
       
-      // sample calc
-      /*
-      risk amount = 100 
-      lot = 1 
-      tick_value = 1
-      trade points = 1e-5 
-      Ask = 1.26000
-      sl_price = 1.25900
-      
-      */
       sl_price = entry_price - ((risk_profile.RP_amount) / (risk_profile.RP_lot * tick_value* (1/trade_points)));
       
    }
@@ -191,16 +223,6 @@ struct TradeParameters{
       if (trade_type == "market") entry_price = price_bid();
       if (trade_type == "pending") entry_price = last_candle_open();
       
-      /*
-      sample calc
-      
-      risk amount = 100
-      lot = 1
-      tick_value = 1
-      trade_poitns = 1e-5
-      Bid = 1.260000
-      sl_price = 
-      */
       
       // THIS IS A BACKUP (Original, Working)
       ///sl_price = entry_price + ((InpRiskAmount) / (InpLot * tick_value * (1 / trade_points)));
@@ -239,12 +261,34 @@ struct TradeParameters{
       return trade_close_price;
    }
    
-/*
-1. calculate scaled lot 
-2. decide trade parameters based on order type 
-3. entry price reference
-
-*/
+   void set_delayed_entry(double price){
+      logger(StringFormat("Last Open: %f", last_candle_open()));
+      logger(StringFormat("Set Delayed Entry Reference Price: %f", price));
+      delayed_entry_reference = price;
+   }
+   
+   bool delayed_entry_valid(){
+      // get order type, 
+      // if buy, entry reference > Ask 
+      // if sell, entry reference < Bid
+      bool valid;
+      switch (risk_profile.RP_order_type){
+         case 0:
+            // long 
+            valid = delayed_entry_reference > price_ask() ? true : false;
+            break;
+         case 1:
+            // short 
+            valid = delayed_entry_reference < price_bid() ? true : false;
+            break;
+         default:
+            valid = false;
+            break;
+      }
+      if (valid) logger(StringFormat("Delayed Entry Valid: %i, Reference: %f, Entry: %f", valid, delayed_entry_reference, trade_params.entry_price));
+      return valid;
+   }
+   
    
 };
 
@@ -291,7 +335,6 @@ struct TradesActive{
       
       
       trade_close_datetime = StructToTime(trade_close_struct);
-      Print("TRADE CLOSE DATETIME: ", trade_close_datetime);
    }
    
    bool check_trade_deadline(datetime trade_open_time){
@@ -307,7 +350,7 @@ struct TradesActive{
       int arr_size = ArraySize(active_positions);
       ArrayResize(active_positions, arr_size + 1);
       active_positions[arr_size] = active_pos;
-      logger(StringFormat("Updated active positions: %i", num_active_positions()));
+      logger(StringFormat("Updated active positions: %i, Ticket: %i", num_active_positions(), active_pos.pos_ticket));
    }
    
    int num_active_positions(){ return ArraySize(active_positions); }
@@ -430,7 +473,6 @@ int OnInit()
    #endif 
    risk_profile.set_risk_profile();
    //set_deadline();
-   initial_deposit = account_balance();
    
    orders_ea();
    trade_queue.set_next_trade_window();
@@ -455,26 +497,33 @@ void OnTick()
   {
    if (IsNewCandle() && correct_period()){
       // check here for time interval 
-      if (trade_queue.IsTradeWindow() && trades_active.num_active_positions() == 0 && orders_ea() == 0 && trades_active.orders_today == 0){
+      if (valid_trade_open()){
          // time is in between open and close time 
          if (send_order() == -1) { 
             // add recusrion here? 
+            // store last open price, and use it as reference, for delayed entry
+            //trade_params.set_delayed_entry(last_candle_open());
             
-            logger(StringFormat("Bad Spread for Market Order: ", market_spread())); }
+         }
             //send_limit_order();
 
       }
       else{
          if (TimeCurrent() >= trade_queue.curr_trade_close) { close_order(); }
+       
       }
       // check order here. if order is active, increment
       
       trade_queue.set_next_trade_window();
       check_order_deadline();
       int positions_added = orders_ea();
-      logger(StringFormat("Checked Order Pool. %i Positions Found.", positions_added));
-      logger(StringFormat("%i Orders in Active List", trades_active.num_active_positions()));
+      if (trade_queue.IsTradeWindow()){
+         logger(StringFormat("Checked Order Pool. %i Positions Found.", positions_added));
+         logger(StringFormat("%i Orders in Active List", trades_active.num_active_positions()));
+      }
+      
       if (trade_queue.IsNewDay()) { trades_active.clear_orders_today(); }
+      modify_order();
       create_comments();
    }
   }
@@ -529,16 +578,63 @@ bool update_csv(string log_type){
    return true;
 }
 
+bool delayed_valid(){
+   /*
+   Checks if entry is delayed, and if valid. 
+   */
+   trade_params.get_trade_params("market");
+   if (TimeCurrent() > trade_queue.curr_trade_open && !trade_params.delayed_entry_valid()) return 0;
+   return 1;
+}
+
 int send_order(){
    // if bad spread, record the entry price (bid / ask), then enter later if still valid
    
-
+   /*
+   Potential Solutions / Ideas for handling bad spreads:
+   1. Delay, recursive
+      -> recursion method given an input delay. Calls the send_order function after the delay while checking the spread. 
+      -> Does not check if price is optimal (entered exactly at entry window candle open price)
+      -> Optional: Allow checking if price is optimal
    
-   if (market_spread() >= 50) { return -1; }
-   //int ticket = OrderSend(Symbol(), OP_BUY, trade_params.calc_lot(), Ask, 3, trade_params.sl_price, 0, NULL, 0, 0, clrNONE);
-   trade_params.get_trade_params("market");
+   2. Interval
+      -> If spread is bad, skips to next interval. 
+      -> Checks if price is optimal (exactly, or better than candle open price)
+      
+   3. Ignore
+      -> If spread is bad, halts trading for the day. 
+   */
+   
+   
    ENUM_ORDER_TYPE order_type = ord_type();
-   //double entry_price = order_type == ORDER_TYPE_BUY ? price_ask() : price_bid();
+   if (TimeCurrent() == trade_queue.curr_trade_open) trade_params.set_delayed_entry(delayed_entry_reference()); // sets the reference price to the entry window candle open price
+   int delay = InpSpreadDelay * 1000; // Spread delay in seconds * 1000 milliseconds
+   
+   
+   
+   
+   switch (InpSpreadMgt){
+      case 0: // interval 
+         if (market_spread() >= risk_profile.RP_spread) return -1;
+         if (!delayed_valid()) return -1;
+         break;
+      case 1: // recursive
+         while (market_spread() >= risk_profile.RP_spread || !delayed_valid()){
+            Sleep(delay);
+            if (TimeCurrent() >= trade_queue.curr_trade_close) return -1;
+         }
+         break;
+         
+      case 2: // ignore 
+         if (TimeCurrent() > trade_queue.curr_trade_open) return -1;
+         if (market_spread() >= risk_profile.RP_spread) return -1;
+         break; 
+      default: 
+         break;
+   }
+   
+   
+   
    int ticket = order_open(Symbol(), order_type, trade_params.calc_lot(), trade_params.entry_price, trade_params.sl_price, 0);
    if (ticket == -1) logger(StringFormat("ORDER SEND FAILED. ERROR: %i", GetLastError()));
    trades_active.set_trade_open_datetime(TimeCurrent(), ticket);
@@ -577,13 +673,14 @@ int send_limit_order(){
    return 1;
 }
 
-void close_order(){
+int close_order(){
    /*
    Main Close order method.
    */
    //Print("Attempting to close orders.");
    int open_positions = PosTotal();
    order_close_all();
+   return 1;
 }
 
 
@@ -627,8 +724,6 @@ int orders_ea(){
    
    for (int i = 0; i < open_positions; i++){
    
-      //int t = OrderSelect(i, SELECT_BY_POS, MODE_TRADES);
-      //if (PosMagic() == InpMagic && PosSymbol() == Symbol()) { 
       if (trade_match(i)){
          trades_found++;
          int ticket = PosTicket();
@@ -694,7 +789,61 @@ void create_comments(){
 }
 
 // WRAPPERS
+bool modify_order(){
+   switch(InpTradeMgt){
+      case 0: 
+         // breakeven
+         set_breakeven();
+         break;
+      case 1:
+         // trailing stop 
+         trail_stop();
+         break;
+      default: 
+         break; 
+         
+   }
+   return 1;
+}
+
+
+bool valid_trade_open(){
+   /*
+   Boolean function for checking trade validity based on: 
+      1. Entry Window -> trade_queue.IsTradeWindow()
+      2. Active Positions -> trades_active.num_active_positions()
+      3. OrdersEA -> orders_ea() -> redundancy
+      4. Orders Today -> trades_active.orders_today 
+      
+   Returns true if all conditions are satisfied (still in entry window, no active positions, no trades opened yet)
+   Otherwise, returns false. 
+   */
+   if (trade_queue.IsTradeWindow() && trades_active.num_active_positions() == 0 && orders_ea() == 0 && trades_active.orders_today == 0) return true; 
+   return false;
+}
+
+double delayed_entry_reference(){
+   double last_open = iOpen(Symbol(), PERIOD_CURRENT, 0); 
+   double reference = 0;
+   double spread_factor = risk_profile.RP_spread * trade_params.trade_points;
+   
+   switch(risk_profile.RP_order_type){
+      case 0:
+         //long 
+         reference = last_open + spread_factor;
+         break;
+      case 1: 
+         // short 
+         reference = last_open;
+         break;
+      default: 
+         break;
+   }
+   return reference;
+}
+
 double last_candle_open() { return iOpen(Symbol(), PERIOD_CURRENT, 0); }
+double last_candle_close() { return iClose(Symbol(), PERIOD_CURRENT, 0); }
 
 double account_balance() { return AccountInfoDouble(ACCOUNT_BALANCE);}
 string account_server() { return AccountInfoString(ACCOUNT_SERVER); }
@@ -751,6 +900,62 @@ int IsPending(ENUM_ORDER_TYPE ord_type){
 }
 
 
+int set_breakeven(){ 
+   
+   if (InpTradeMgt == Trailing) return 0;
+   
+   int active = trades_active.num_active_positions();
+   for (int i = 0; i < active; i++){
+      int ticket = trades_active.active_positions[i].pos_ticket;
+      if (PosProfit() < 0) continue; 
+      int s = order_select_by_ticket(ticket);
+      int c = modify_sl(PosOpenPrice());
+   }
+   return 1;
+}
+
+
+
+int trail_stop(){
+   int active = trades_active.num_active_positions();
+   
+   for (int i = 0; i < active; i++){
+      int ticket = trades_active.active_positions[i].pos_ticket;
+      int s = order_select_by_ticket(ticket); // IMPORTANT
+      
+      double trade_open_price = PosOpenPrice();      
+      double last_open_price = last_candle_open();
+      
+      double diff = MathAbs(trade_open_price - last_open_price) / trade_params.trade_points;
+      
+      if (diff < InpTrailInterval) continue; 
+      
+      ENUM_ORDER_TYPE position_order_type = PosOrderType();
+      
+      double updated_sl = PosSL();
+      double current_sl = updated_sl;
+      
+      int c = 0;
+      double trail_factor = InpTrailInterval * trade_params.trade_points;
+      switch(position_order_type){
+         case 0:
+            updated_sl = last_open_price - trail_factor;
+            if (updated_sl < current_sl) continue;
+            break;
+         case 1:
+            updated_sl = last_open_price + trail_factor;
+            if (updated_sl > current_sl) continue;
+            break;
+         default:
+            continue;
+      }
+      c = modify_sl(updated_sl);
+      if (c) logger("Trail Stop Updated");
+      
+   }
+   return 1;
+}
+
 #ifdef __MQL4__
 double price_mean() {
    double mean = (price_ask() + price_bid()) / 2;
@@ -771,7 +976,11 @@ double PosLots() { return OrderLots(); }
 string PosSymbol() { return OrderSymbol(); }
 int PosMagic() { return OrderMagicNumber(); }
 int PosOpenTime() { return OrderOpenTime(); }
-
+double PosOpenPrice() { return OrderOpenPrice(); }
+double PosProfit() { return OrderProfit(); }
+ENUM_ORDER_TYPE PosOrderType() { return OrderType(); }
+double PosSL(){ return OrderStopLoss(); }
+double PosTP(){ return OrderTakeProfit(); }
 
 int order_close_all(){
    int open_positions = ArraySize(trades_active.active_positions);
@@ -830,10 +1039,30 @@ bool trade_match(int index){
    if (PosSymbol() != Symbol()) return false;
    return true;
 }
+
+
+int order_select_by_ticket(int ticket){
+   int s = OrderSelect(ticket, SELECT_BY_TICKET, MODE_TRADES);
+   return s;
+}
+
+int modify_sl(double sl){
+   // SELECT THE TICKET PLEASE
+   int m = OrderModify(PosTicket(), PosOpenPrice(), sl, 0, 0, clrNONE);
+   return m;
+}
+
 #endif 
 
 
+
 #ifdef __MQL5__
+
+double spread_new(){
+   double diff = price_ask() - price_bid();
+   double spread = diff / trade_pts();
+   return spread;
+}
 
 double tick_val() { return SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_VALUE);}
 double trade_pts() { return SymbolInfoDouble(Symbol(), SYMBOL_POINT);}
@@ -849,21 +1078,12 @@ double PosLots() { return PositionGetDouble(POSITION_VOLUME); }
 string PosSymbol() { return PositionGetString(POSITION_SYMBOL); }
 int PosMagic() { return PositionGetInteger(POSITION_MAGIC); }
 int PosOpenTime() { return PositionGetInteger(POSITION_TIME); }
-/*
+double PosOpenPrice() { return PositionGetDouble(POSITION_PRICE_OPEN); }
+double PosProfit() { return PositionGetDouble(POSITION_PROFIT); }
+ENUM_ORDER_TYPE PosOrderType() { return PositionGetInteger(POSITION_TYPE); }
+double PosSL() { return PositionGetDouble(POSITION_SL); }
+double PosTP() { return PositionGetDouble(POSITION_TP); }
 
-int order_close(){
-   int index = 0;
-   //int t = PositionSelect(Symbol());
-   int t = PositionSelectByTicket(PositionGetTicket(index));
-   string position_symbol = PositionGetString(POSITION_SYMBOL);
-   if (PositionGetInteger(POSITION_MAGIC) != InpMagic) { return -1; }
-   if (position_symbol != Symbol()) { return -1; }
-   Print("MATCH. POS: ", position_symbol);
-   int c = Trade.PositionClose(PositionGetTicket(index));
-   return c;
-}
-
-*/
 
 int order_close_all(){
    int tickets[];
@@ -885,18 +1105,21 @@ int order_close_all(){
       tickets[arr_size] = ticket;
    }
    int total_trades = ArraySize(tickets);
-   Print(total_trades, " Trades added.");
+   //Print(total_trades, " Trades added.");
    
    
    // close added trades
    int trades_closed = 0;
    for (int i = 0; i < ArraySize(tickets); i++){
       Print("TICKETS: ", tickets[i]);
-      int c = Trade.PositionClose(tickets[i]);
+      int c = close_trade(tickets[i]);
+      if (c == -2) {
+         logger("Cannot close trade. Trail Stop is set.");
+         break;
+      }
       if (c) { 
          trades_closed += 1;
          trade_log.set_order_close_log_info(trade_params.close_price(), TimeCurrent(), PosTicket());
-         Print("SPREAD: ", trade_log.order_open_spread);
          if (!update_csv("close")) {Print("Failed to write to CSV. Order: CLOSE"); }
          if (c){ Print("Closed: ",PosTicket()); }
          
@@ -916,7 +1139,8 @@ int close_trade(int ticket){
    switch(pending){
       case 0: 
          // market order
-         c = Trade.PositionClose(ticket);
+         if (PositionGetDouble(POSITION_PROFIT) > 0 && InpTradeMgt == Trailing) return -2; // ignores open positions in profit when using trail stop 
+         c = Trade.PositionClose(ticket); // closes positions in loss when using trail stop 
          if (!c) { logger(StringFormat("ORDER CLOSE FAILED. TICKET: %i, ERROR: %i", ticket, GetLastError()));}
          break;
       case 1:
@@ -926,6 +1150,7 @@ int close_trade(int ticket){
          break;
          
       case -1:
+         // invalid order type
          return -1;
          break;
       default:
@@ -935,18 +1160,35 @@ int close_trade(int ticket){
    
    if (!update_csv("close")) { logger("Failed to write to CSV. Order: CLOSE"); }
    if (c) { logger(StringFormat("Closed: %i", PosTicket())); }
-   return 1;
+   return c;
 }
 
 
 
-bool order_open(string symbol, ENUM_ORDER_TYPE order_type, double volume, double price, double sl, double tp){
+int order_open(string symbol, ENUM_ORDER_TYPE order_type, double volume, double price, double sl, double tp){
    
    bool t = Trade.PositionOpen(symbol, order_type, volume, price, sl, tp, NULL);
-   PrintFormat("Symbol: %s, Ord Type: %s, Vol: %f, Price: %f, SL: %f, TP: %f", symbol, EnumToString(order_type), volume, price, sl, tp);
+   logger(StringFormat("Symbol: %s, Ord Type: %s, Vol: %f, Price: %f, SL: %f, TP: %f, Spread: %f", symbol, EnumToString(order_type), volume, price, sl, tp, market_spread()));
    if (!t) { Print(GetLastError()); }
-   return t;
+   int order_ticket = select_ticket();
+   return order_ticket;
 }
+
+
+int select_ticket(){
+   int open_positions = PosTotal();
+   for (int i = 0; i < open_positions; i ++){
+      int ticket = PositionGetTicket(i);
+      int t = PositionSelectByTicket(ticket);
+      
+      if (PosMagic() != InpMagic) continue; 
+      if (PosSymbol() != Symbol()) continue; 
+      
+      return ticket;
+   }
+   return 0;
+}
+
 
 bool trade_match(int index){
    int ticket = PositionGetTicket(index);
@@ -954,5 +1196,16 @@ bool trade_match(int index){
    if (PosMagic() != InpMagic) return false;
    if (PosSymbol() != Symbol()) return false;
    return true;
+}
+
+int order_select_by_ticket(int ticket){
+   int s = PositionSelectByTicket(ticket);
+   return s;
+}
+
+int modify_sl(double sl){
+   // SELECT THE TICKET PLEASE
+   int m = Trade.PositionModify(PosTicket(), sl, PosTP());
+   return m;
 }
 #endif 
