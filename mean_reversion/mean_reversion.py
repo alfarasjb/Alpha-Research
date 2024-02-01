@@ -17,13 +17,8 @@ class Mean_Reversion:
 
     
     def get_adf(self):
-        adf = ts.adfuller(self.dataset)
+        test_stat, p_val, _, n, crit_val, _ = ts.adfuller(self.dataset)
 
-        test_stat = adf[0]
-        p_val = adf[1]
-        n = adf[3]
-        crit_val = adf[4]
-        
         confidence = None
         
         for i,j in enumerate(crit_val.values()):
