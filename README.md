@@ -4,6 +4,7 @@
 
 | Project Title | Description | 
 | ------------- | ----------- |
+| [Momentum](https://github.com/alfarasjb/Alpha-Research/tree/main/momentum) | Explores momentum strategies with Cryptocurrencies
 | [Mean Reversion](https://github.com/alfarasjb/Alpha-Research/tree/main/mean_reversion) | Contains notebooks testing variations of Mean Reversion strategies on FX Pairs and Instruments on the Philippine Stock Exchange. |
 | [Pairs Trading](https://github.com/alfarasjb/Alpha-Research/blob/main/pairs_trading/pairs_trading.ipynb) | Contains notebooks testing variations of Pairs Trading strategies on FX Pairs and Instruments on the Philippine Stock Exchange. |
 | [Crude Seasonality](https://github.com/alfarasjb/Alpha-Research/tree/main/crude_seasonality) | This project contains an evaluation and exploratory data analysis of the potential seasonal trends in Crude Oil, as well as an investigation of its potential returns by trading along its seasonal trends. | 
